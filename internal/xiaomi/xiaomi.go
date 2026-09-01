@@ -58,15 +58,25 @@ var cloudsMu sync.Mutex
 
 func getCloud(userID string) (*xiaomi.Cloud, error) {
 	cloudsMu.Lock()
-	defer cloudsMu.Unlock()
-
 	if cloud := clouds[userID]; cloud != nil {
+		cloudsMu.Unlock()
 		return cloud, nil
 	}
+	token := tokens[userID]
+	cloudsMu.Unlock()
 
 	cloud := xiaomi.NewCloud(AppXiaomiHome)
-	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
+	if err := cloud.LoginWithToken(userID, token); err != nil {
 		return nil, err
+	}
+	if err := persistRotatedToken(userID, token, cloud); err != nil {
+		return nil, err
+	}
+
+	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+	if current := clouds[userID]; current != nil {
+		return current, nil
 	}
 	if clouds == nil {
 		clouds = map[string]*xiaomi.Cloud{userID: cloud}
@@ -81,7 +91,21 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
+
+	cloudsMu.Lock()
+	token := tokens[userID]
+	cloudsMu.Unlock()
+
+	res, err := cloud.Request(GetBaseURL(region), apiURL, params, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = persistRotatedToken(userID, token, cloud); err != nil {
+		log.Warn().Err(err).Str("user", userID).Msg("xiaomi: save passToken")
+	}
+
+	return res, nil
 }
 
 func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
@@ -105,6 +129,27 @@ func getCameraURL(url *url.URL) (string, error) {
 		return getLegacyURL(url)
 	}
 	return getMissURL(url)
+}
+
+func getUserToken(cloud *xiaomi.Cloud) string {
+	_, token := cloud.UserToken()
+	return token
+}
+
+func persistRotatedToken(userID, oldToken string, cloud *xiaomi.Cloud) error {
+	newToken := getUserToken(cloud)
+	if newToken == "" || newToken == oldToken {
+		return nil
+	}
+
+	if err := app.PatchConfig([]string{"xiaomi", userID}, newToken); err != nil {
+		return err
+	}
+
+	cloudsMu.Lock()
+	tokens[userID] = newToken
+	cloudsMu.Unlock()
+	return nil
 }
 
 func getLegacyURL(url *url.URL) (string, error) {
