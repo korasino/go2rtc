@@ -180,7 +180,10 @@ const (
 // Xiaomi Home PTZ operations for MISS_CMD_MOTOR_REQ / MISS_CMD_MOTOR_RESP.
 // angle/elevation are Xiaomi coordinates, not verified physical degrees.
 // operation=13 and ret=-5 are plugin-observed, and cmd 0x112 + {"operation":2}
-// was physically verified on xiaomi.camera.c01a01.
+// was physically verified on xiaomi.camera.c01a01 on September 2, 2026.
+// operation=6 is implemented from Xiaomi Home/plugin semantics, but has not yet
+// been proven to return a usable position response on the tested local MISS path
+// for xiaomi.camera.c01a01; live refresh currently times out there.
 const (
 	motorLeft     = 1
 	motorRight    = 2
