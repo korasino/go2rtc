@@ -150,6 +150,8 @@ func persistRotatedToken(userID, oldToken string, cloud *xiaomi.Cloud) error {
 	cloudsMu.Lock()
 	tokens[userID] = newToken
 	cloudsMu.Unlock()
+
+	log.Info().Str("user", userID).Msg("xiaomi: passToken rotated and persisted")
 	return nil
 }
 
