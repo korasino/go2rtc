@@ -142,6 +142,14 @@ func TestParseMotorResponse(t *testing.T) {
 	require.Equal(t, motorCheckEnd, position.Ret)
 }
 
+func TestParseMotorResponseNullPadding(t *testing.T) {
+	position, err := parseMotorResponse([]byte("{\"ret\":0, \"angle\":48,\"elevation\":0}\x00"))
+	require.NoError(t, err)
+	require.Equal(t, 48, position.Angle)
+	require.Equal(t, 0, position.Elevation)
+	require.Equal(t, 0, position.Ret)
+}
+
 func TestParseMotorResponseMalformed(t *testing.T) {
 	_, err := parseMotorResponse([]byte(`{"angle":73,"ret":0}`))
 	require.ErrorContains(t, err, "missing fields")

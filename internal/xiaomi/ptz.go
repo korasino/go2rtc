@@ -76,6 +76,11 @@ func apiPTZ(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if refresh {
+				if !acquirePTZAction(src) {
+					http.Error(w, "another PTZ operation is running", http.StatusConflict)
+					return
+				}
+				defer releasePTZAction(src)
 				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 				defer cancel()
 
@@ -104,7 +109,36 @@ func apiPTZ(w http.ResponseWriter, r *http.Request) {
 		req.Action = strings.ToLower(req.Action)
 		req.Direction = strings.ToLower(req.Direction)
 
+		if !acquirePTZAction(src) {
+			http.Error(w, "another PTZ operation is running", http.StatusConflict)
+			return
+		}
+		defer releasePTZAction(src)
+
 		switch req.Action {
+		case "center":
+			if !supportsAutoCenter(src) {
+				http.Error(w, "auto-center is only validated on xiaomi.camera.c01a01", http.StatusNotImplemented)
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+			defer cancel()
+			log.Debug().Str("stream", src).Msg("[xiaomi] ptz auto-center")
+			position, err := autoCenter(ctx, ctrl, c300CenterOptions())
+			if err != nil {
+				log.Warn().Str("stream", src).Err(err).Msg("[xiaomi] ptz auto-center failed")
+				if errors.Is(err, errCenterAttempts) {
+					http.Error(w, err.Error(), http.StatusConflict)
+				} else {
+					writePTZError(w, err)
+				}
+				return
+			}
+			state := ctrl.PTZState()
+			state.Position = position
+			state.Connected = true
+			api.ResponseJSON(w, buildPTZResponse(state))
+			return
 		case "move":
 			if req.Direction == "" {
 				http.Error(w, "direction is required", http.StatusBadRequest)

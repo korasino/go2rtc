@@ -400,6 +400,8 @@ func validateTargetPosition(angle, elevation int) error {
 }
 
 func parseMotorResponse(data []byte) (*PTZPosition, error) {
+	data = bytes.TrimRight(data, "\x00")
+
 	var response motorResponse
 	if err := json.Unmarshal(data, &response); err != nil {
 		return nil, fmt.Errorf("xiaomi ptz: malformed motor response: %w", err)
