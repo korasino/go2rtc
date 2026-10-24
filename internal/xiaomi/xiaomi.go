@@ -63,15 +63,23 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
 	if cloud := clouds[userID]; cloud != nil {
 		return cloud, nil
 	}
+	token := tokens[userID]
 
 	cloud := xiaomi.NewCloud(AppXiaomiHome)
-	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
+	cloud.OnRefresh = func() {
+		log.Info().Str("user", userID).Msg("xiaomi: cloud session refreshed")
+	}
+	if err := cloud.LoginWithToken(userID, token); err != nil {
 		return nil, err
 	}
+
 	if clouds == nil {
 		clouds = map[string]*xiaomi.Cloud{userID: cloud}
 	} else {
 		clouds[userID] = cloud
+	}
+	if err := persistRotatedTokenLocked(userID, cloud); err != nil {
+		log.Warn().Err(err).Str("user", userID).Msg("xiaomi: save passToken")
 	}
 	return cloud, nil
 }
@@ -81,7 +89,15 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
+
+	res, err := cloud.Request(GetBaseURL(region), apiURL, params, nil)
+
+	// A refresh may rotate the token even if the retried API request fails.
+	if saveErr := persistRotatedToken(userID, cloud); saveErr != nil {
+		log.Warn().Err(saveErr).Str("user", userID).Msg("xiaomi: save passToken")
+	}
+
+	return res, err
 }
 
 func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
@@ -105,6 +121,38 @@ func getCameraURL(url *url.URL) (string, error) {
 		return getLegacyURL(url)
 	}
 	return getMissURL(url)
+}
+
+func getUserToken(cloud *xiaomi.Cloud) string {
+	_, token := cloud.UserToken()
+	return token
+}
+
+func persistRotatedToken(userID string, cloud *xiaomi.Cloud) error {
+	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+	return persistRotatedTokenLocked(userID, cloud)
+}
+
+// persistRotatedTokenLocked requires cloudsMu to be held by the caller.
+func persistRotatedTokenLocked(userID string, cloud *xiaomi.Cloud) error {
+	// An in-flight request must not overwrite credentials from a newer login.
+	if clouds[userID] != cloud {
+		return nil
+	}
+	newToken := getUserToken(cloud)
+	if newToken == "" || newToken == tokens[userID] {
+		return nil
+	}
+
+	if err := app.PatchConfig([]string{"xiaomi", userID}, newToken); err != nil {
+		return err
+	}
+
+	tokens[userID] = newToken
+
+	log.Info().Str("user", userID).Msg("xiaomi: passToken rotated and persisted")
+	return nil
 }
 
 func getLegacyURL(url *url.URL) (string, error) {
@@ -333,9 +381,9 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
 		} else {
 			tokens[userID] = token
 		}
-		cloudsMu.Unlock()
-
+		delete(clouds, userID)
 		err = app.PatchConfig([]string{"xiaomi", userID}, token)
+		cloudsMu.Unlock()
 	}
 
 	if err != nil {

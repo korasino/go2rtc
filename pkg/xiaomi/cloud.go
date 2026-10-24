@@ -17,12 +17,16 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 type Cloud struct {
+	// OnRefresh is called after a successful session refresh. Set before use.
+	OnRefresh func()
+
 	client *http.Client
 
 	sid       string
@@ -33,6 +37,9 @@ type Cloud struct {
 	passToken string
 
 	auth map[string]string
+
+	authMu    sync.RWMutex
+	refreshMu sync.Mutex
 }
 
 func NewCloud(sid string) *Cloud {
@@ -121,10 +128,8 @@ func (c *Cloud) Login(username, password string) error {
 	}
 
 	c.auth = nil
-	c.ssecurity = v2.Ssecurity
-	c.passToken = v2.PassToken
 
-	return c.finishAuth(v2.Location)
+	return c.finishAuthWith(v2.Location, "", v2.PassToken, v2.Ssecurity)
 }
 
 func (c *Cloud) LoginWithCaptcha(captcha string) error {
@@ -314,6 +319,16 @@ func (l *LoginError) Error() string {
 }
 
 func (c *Cloud) finishAuth(location string) error {
+	c.authMu.RLock()
+	userID := c.userID
+	passToken := c.passToken
+	ssecurity := append([]byte(nil), c.ssecurity...)
+	c.authMu.RUnlock()
+
+	return c.finishAuthWith(location, userID, passToken, ssecurity)
+}
+
+func (c *Cloud) finishAuthWith(location, userID, passToken string, ssecurity []byte) error {
 	res, err := c.client.Get(location)
 	if err != nil {
 		return err
@@ -332,13 +347,13 @@ func (c *Cloud) finishAuth(location string) error {
 		for _, cookie := range res.Cookies() {
 			switch cookie.Name {
 			case "userId":
-				c.userID = cookie.Value
+				userID = cookie.Value
 			case "cUserId":
 				cUserId = cookie.Value
 			case "serviceToken":
 				serviceToken = cookie.Value
 			case "passToken":
-				c.passToken = cookie.Value
+				passToken = cookie.Value
 			}
 		}
 
@@ -349,13 +364,18 @@ func (c *Cloud) finishAuth(location string) error {
 			if err = json.Unmarshal([]byte(s), &v1); err != nil {
 				return err
 			}
-			c.ssecurity = v1.Ssecurity
+			ssecurity = v1.Ssecurity
 		}
 
 		res = res.Request.Response
 	}
 
-	c.cookies = fmt.Sprintf("userId=%s; cUserId=%s; serviceToken=%s", c.userID, cUserId, serviceToken)
+	c.authMu.Lock()
+	c.userID = userID
+	c.passToken = passToken
+	c.ssecurity = ssecurity
+	c.cookies = fmt.Sprintf("userId=%s; cUserId=%s; serviceToken=%s", userID, cUserId, serviceToken)
+	c.authMu.Unlock()
 
 	return nil
 }
@@ -381,22 +401,34 @@ func (c *Cloud) LoginWithToken(userID, passToken string) error {
 	if _, err = readLoginResponse(res.Body, &v1); err != nil {
 		return err
 	}
+	if v1.Location == "" {
+		return errors.New("xiaomi: login response missing location")
+	}
 
-	c.ssecurity = v1.Ssecurity
-	c.passToken = v1.PassToken
-
-	return c.finishAuth(v1.Location)
+	return c.finishAuthWith(v1.Location, userID, v1.PassToken, v1.Ssecurity)
 }
 
 func (c *Cloud) UserToken() (string, string) {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+
 	return c.userID, c.passToken
 }
 
 func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]string) ([]byte, error) {
+	retry := true
+
+retryRequest:
+	c.authMu.RLock()
+	requestPassToken := c.passToken
+	requestCookies := c.cookies
+	requestSsecurity := append([]byte(nil), c.ssecurity...)
+	c.authMu.RUnlock()
+
 	form := url.Values{"data": {params}}
 
 	nonce := genNonce()
-	signedNonce := genSignedNonce(c.ssecurity, nonce)
+	signedNonce := genSignedNonce(requestSsecurity, nonce)
 
 	// 1. gen hash for data param
 	form.Set("rc4_hash__", genSignature64("POST", apiURL, form, signedNonce))
@@ -421,7 +453,7 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
 		return nil, err
 	}
 
-	req.Header.Set("Cookie", c.cookies)
+	req.Header.Set("Cookie", requestCookies)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	for k, v := range headers {
@@ -432,13 +464,22 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, errors.New(res.Status)
+		_ = res.Body.Close()
+		err = errors.New(res.Status)
+		if retry && (res.StatusCode == http.StatusUnauthorized || isTokenExpired(err)) {
+			if err = c.refreshAuth(requestPassToken, requestCookies); err != nil {
+				return nil, err
+			}
+			retry = false
+			goto retryRequest
+		}
+		return nil, err
 	}
 
 	body, err := io.ReadAll(res.Body)
+	_ = res.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -463,10 +504,54 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
 	}
 
 	if res1.Code != 0 {
-		return nil, errors.New("xiaomi: " + res1.Message)
+		err = fmt.Errorf("xiaomi: code=%d message=%s", res1.Code, res1.Message)
+		if retry && isTokenExpired(err) {
+			if err = c.refreshAuth(requestPassToken, requestCookies); err != nil {
+				return nil, err
+			}
+			retry = false
+			goto retryRequest
+		}
+		return nil, err
 	}
 
 	return res1.Result, nil
+}
+
+func (c *Cloud) refreshAuth(passToken, cookies string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	c.authMu.RLock()
+	currentPassToken := c.passToken
+	currentCookies := c.cookies
+	currentUserID := c.userID
+	c.authMu.RUnlock()
+
+	if currentPassToken != passToken || currentCookies != cookies {
+		return nil
+	}
+
+	if err := c.LoginWithToken(currentUserID, currentPassToken); err != nil {
+		return err
+	}
+	if c.OnRefresh != nil {
+		c.OnRefresh()
+	}
+	return nil
+}
+
+func isTokenExpired(err error) bool {
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "401 unauthorized") ||
+		strings.Contains(msg, "421 unauthorized") ||
+		strings.Contains(msg, "xiaomi: code=2 ") ||
+		strings.Contains(msg, "xiaomi: code=3 ") ||
+		strings.Contains(msg, "auth err") ||
+		strings.Contains(msg, "invalid signature") ||
+		strings.Contains(msg, "servicetoken_expired") ||
+		strings.Contains(msg, "xiaomi: unauthorized")
 }
 
 func readLoginResponse(rc io.ReadCloser, v any) ([]byte, error) {
