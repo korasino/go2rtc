@@ -59,30 +59,28 @@ var cloudsMu sync.Mutex
 
 func getCloud(userID string) (*xiaomi.Cloud, error) {
 	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+
 	if cloud := clouds[userID]; cloud != nil {
-		cloudsMu.Unlock()
 		return cloud, nil
 	}
 	token := tokens[userID]
-	cloudsMu.Unlock()
 
 	cloud := xiaomi.NewCloud(AppXiaomiHome)
+	cloud.OnRefresh = func() {
+		log.Info().Str("user", userID).Msg("xiaomi: cloud session refreshed")
+	}
 	if err := cloud.LoginWithToken(userID, token); err != nil {
 		return nil, err
 	}
-	if err := persistRotatedToken(userID, token, cloud); err != nil {
-		return nil, err
-	}
 
-	cloudsMu.Lock()
-	defer cloudsMu.Unlock()
-	if current := clouds[userID]; current != nil {
-		return current, nil
-	}
 	if clouds == nil {
 		clouds = map[string]*xiaomi.Cloud{userID: cloud}
 	} else {
 		clouds[userID] = cloud
+	}
+	if err := persistRotatedTokenLocked(userID, cloud); err != nil {
+		log.Warn().Err(err).Str("user", userID).Msg("xiaomi: save passToken")
 	}
 	return cloud, nil
 }
@@ -93,20 +91,14 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
 		return nil, err
 	}
 
-	cloudsMu.Lock()
-	token := tokens[userID]
-	cloudsMu.Unlock()
-
 	res, err := cloud.Request(GetBaseURL(region), apiURL, params, nil)
-	if err != nil {
-		return nil, err
+
+	// A refresh may rotate the token even if the retried API request fails.
+	if saveErr := persistRotatedToken(userID, cloud); saveErr != nil {
+		log.Warn().Err(saveErr).Str("user", userID).Msg("xiaomi: save passToken")
 	}
 
-	if err = persistRotatedToken(userID, token, cloud); err != nil {
-		log.Warn().Err(err).Str("user", userID).Msg("xiaomi: save passToken")
-	}
-
-	return res, nil
+	return res, err
 }
 
 func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
@@ -137,9 +129,20 @@ func getUserToken(cloud *xiaomi.Cloud) string {
 	return token
 }
 
-func persistRotatedToken(userID, oldToken string, cloud *xiaomi.Cloud) error {
+func persistRotatedToken(userID string, cloud *xiaomi.Cloud) error {
+	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+	return persistRotatedTokenLocked(userID, cloud)
+}
+
+// persistRotatedTokenLocked requires cloudsMu to be held by the caller.
+func persistRotatedTokenLocked(userID string, cloud *xiaomi.Cloud) error {
+	// An in-flight request must not overwrite credentials from a newer login.
+	if clouds[userID] != cloud {
+		return nil
+	}
 	newToken := getUserToken(cloud)
-	if newToken == "" || newToken == oldToken {
+	if newToken == "" || newToken == tokens[userID] {
 		return nil
 	}
 
@@ -147,9 +150,7 @@ func persistRotatedToken(userID, oldToken string, cloud *xiaomi.Cloud) error {
 		return err
 	}
 
-	cloudsMu.Lock()
 	tokens[userID] = newToken
-	cloudsMu.Unlock()
 
 	log.Info().Str("user", userID).Msg("xiaomi: passToken rotated and persisted")
 	return nil
@@ -381,9 +382,9 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
 		} else {
 			tokens[userID] = token
 		}
-		cloudsMu.Unlock()
-
+		delete(clouds, userID)
 		err = app.PatchConfig([]string{"xiaomi", userID}, token)
+		cloudsMu.Unlock()
 	}
 
 	if err != nil {

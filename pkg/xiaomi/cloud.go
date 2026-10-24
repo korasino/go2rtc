@@ -24,6 +24,9 @@ import (
 )
 
 type Cloud struct {
+	// OnRefresh is called after a successful session refresh. Set before use.
+	OnRefresh func()
+
 	client *http.Client
 
 	sid       string
@@ -395,12 +398,11 @@ func (c *Cloud) LoginWithToken(userID, passToken string) error {
 		PassToken string `json:"passToken"`
 		Location  string `json:"location"`
 	}
-	body, err := readLoginResponse(res.Body, &v1)
-	if err != nil {
+	if _, err = readLoginResponse(res.Body, &v1); err != nil {
 		return err
 	}
 	if v1.Location == "" {
-		return fmt.Errorf("xiaomi: %s", body)
+		return errors.New("xiaomi: login response missing location")
 	}
 
 	return c.finishAuthWith(v1.Location, userID, v1.PassToken, v1.Ssecurity)
@@ -462,11 +464,11 @@ retryRequest:
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
+		_ = res.Body.Close()
 		err = errors.New(res.Status)
-		if retry && isTokenExpired(err) {
+		if retry && (res.StatusCode == http.StatusUnauthorized || isTokenExpired(err)) {
 			if err = c.refreshAuth(requestPassToken, requestCookies); err != nil {
 				return nil, err
 			}
@@ -477,6 +479,7 @@ retryRequest:
 	}
 
 	body, err := io.ReadAll(res.Body)
+	_ = res.Body.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -529,7 +532,13 @@ func (c *Cloud) refreshAuth(passToken, cookies string) error {
 		return nil
 	}
 
-	return c.LoginWithToken(currentUserID, currentPassToken)
+	if err := c.LoginWithToken(currentUserID, currentPassToken); err != nil {
+		return err
+	}
+	if c.OnRefresh != nil {
+		c.OnRefresh()
+	}
+	return nil
 }
 
 func isTokenExpired(err error) bool {
